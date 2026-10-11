@@ -38,7 +38,7 @@ flowchart LR
     ttsapi["Text to speech<br/>ElevenLabs Flash v2.5, cached by text"]
     cmd["Jev (TypeSafe)<br/>Choice: destination, cancel or unsupported;<br/>Choice: speak or quiet"]
     buf[("Session frame buffer<br/>last 4 frames")]
-    wrk["Worker<br/>locate, route once, follow the route on votes;<br/>compares with previous output,<br/>Jev decides whether a change is spoken"]
+    wrk["Worker<br/>locate, route once, follow the route<br/>on a probability per node;<br/>compares with previous output,<br/>Jev decides whether a change is spoken"]
     nav["Navigation engine: nav-engine's nav-api<br/>localize: frames to the user's node<br/>route: next hop and its instruction"]
     navmap[("Venue map<br/>published by nav-engine, reviewed")]
     route[("Place<br/>the map the phone chose;<br/>destinations: its nodes, by name")]
@@ -107,7 +107,7 @@ sequenceDiagram
       O->>K: evaluate the frames not sent yet
       K->>N: localize: new frames + motion, hop source and target
       N-->>K: ranked nodes, best and margin
-      Note over K: a vote: located, reached the hop's target, or lost
+      Note over K: belief updated: located, reached a node ahead, or lost
       opt located (start of the session, or after lost)
         K->>N: route: user's node to destinationId (once)
         N-->>K: hops (target, steps, instruction)
@@ -145,7 +145,7 @@ sequenceDiagram
 | Speech to text (ElevenLabs Scribe v2) | Audio to transcript | Meaning of the request |
 | Text to speech (ElevenLabs Flash v2.5) | Text to MP3 stream, proxied and cached by the Orchestrator | Wording, timing |
 | Jev (TypeSafe) | Turning a transcript into `start(destinationId)`, `cancel` or `unsupported`, and judging whether a changed direction is worth saying, each with a confidence | Route progress, wording |
-| Worker | The navigation loop: locating the user with `localize`, one `route`, following it on votes (to the next node or one further on), starting over when lost; comparing each output with the session's previous output, choosing guidance or heartbeat | Model internals, the map |
+| Worker | The navigation loop: locating the user with `localize`, one `route`, following it on a belief over the map's nodes (to the next node or one further on), starting over when lost; comparing each output with the session's previous output, choosing guidance or heartbeat | Model internals, the map |
 | Navigation engine (nav-engine's nav-api) | Which node of the venue map the frames show (`confirmed`, `uncertain` or `lost`), and the route to the destination with each hop's spoken instruction | The user's position between calls (it is stateless), deciding whether to speak |
 | Sentence templates | A fallback sentence per action, when the route hop has no instruction that fits 240 characters | Route validity |
 | Place | The map the phone chose (`GET /v1/maps`, default `NAV_MAP_ID`) and its destinations: every node, by name, read from nav-api when the client is created | Paths, which come from nav-api |
@@ -173,8 +173,8 @@ What it does not have yet: localization tested on a walk the map was not built f
 4. **Where the backend runs.** Tunnel to the local GPU server or a Google Cloud service in front of it. Decides who holds the auth secret.
 5. **Silent frames.** When the output is unchanged, the server sends a heartbeat or state-only event so the phone can tell "quiet by choice" from "connection lost".
 6. **Command classifier runs once per input.** After a session starts, frames go straight to the worker. A new voice command re-enters at step 2.
-7. **Each frame once.** `localize` gets the frames not sent before (usually 1), so the votes of consecutive calls are over different frames. nav-api takes 1 to 4 and scores a burst by the mean over its frames.
+7. **Each frame once.** `localize` gets the frames not sent before (usually 1), so consecutive results are over different frames. nav-api takes 1 to 4 and scores a burst by the mean over its frames.
 8. **Navigation contract.** Decided: the Orchestrator calls nav-api's `localize` and `route` ([contracts.md section 2](contracts.md#2-orchestrator--navigation-engine)); orient-orchestrator `main` does since 2026-10-10. Staging releases use the real nav-api by default; ticking `fake_nav` uses the fake navigation engine for one release.
 9. **Destinations.** Decided: any published map, chosen on the phone (`GET /v1/maps`, remembered per phone; default `NAV_MAP_ID`, `itnig`), and every node on it, by its name. A newly mapped place works without a server change. With `observed` edges a place is only reachable the ways its walks went: on Itnig, from the entrance to the back of the hall and not back.
 10. **No verified edges.** nav-api's `route` with `trust: verified` finds no route on the current maps, so the Orchestrator routes over walked connections in either direction (`NAV_TRUST=any`; the published map keeps only walked ones). The way back along a connection walked one way uses an instruction the map model wrote and nobody walked. Someone has to walk and verify the demo route in the viewer before S11, then set `NAV_TRUST=verified`.
-11. **Localization is untested on held-out walks.** The Itnig map has one walk, and that walk's frames match themselves. nav-api's thresholds (confirm at 0.45 with a 0.05 margin, lost under 0.35) and the loop's votes (3 of 4, margin 0.04) were tuned on the two mapping walks. A second walk of the demo route is needed to tune them before S11.
+11. **Localization is tuned on replays, not live.** nav-api's thresholds (confirm at 0.45 with a 0.05 margin, lost under 0.35) no longer drive the loop, which weighs score differences into a belief. Its settings were tuned in nav-engine (`nav map tune`) on routes stitched from the four Itnig walks, each matched against the other walks' references; live frames separate nodes less than replayed ones, so the temperature is a calibration until staging traces confirm it.
