@@ -306,10 +306,11 @@ nav-api is stateless. The orchestrator keeps the navigation state in the session
 
 A session's navigation state: the user's node (the last node reached, kept into the next session) with the phone's `stepCount` when they reached it, the route's hops (none while locating), the current hop, and the **belief**: a probability per node of the map, where the user is. Each call sends the frames not sent before, so consecutive results are over different frames. The worker calls once `NAV_BURST` such frames are waiting.
 
-Each `localize` result updates the belief in two steps (orient-orchestrator `pipeline::Belief`, the same rules as nav-engine's `navigation/belief.py`):
+Each `localize` result updates the belief in two steps (orient-orchestrator `pipeline::Belief`, the same rules as nav-engine's `navigation/belief.py`), or in one when it carries a confirmed pose:
 
 - **Moving.** Walking w metres since the last result (the newest `stepCount` minus the last one, times the map's live step length, times `NAV_BELIEF_WALK_SCALE`; `NAV_BELIEF_WALK_M_PER_CALL` without steps), the user leaves node a for a node b linked to it on the map (its `links`, either way) at a rate w / metres(a, b). `NAV_BELIEF_JUMP` of the belief then spreads over every node: a move the camera and the steps missed.
-- **Seeing.** Each node is multiplied by exp((its score − the best score) / `NAV_BELIEF_TEMPERATURE`), and by `NAV_BELIEF_GATE` when nav-api marks it `plausible: false` (farther than walked). A node not among the candidates scores as the lowest listed, at most `best` minus `margin`. Only score differences count: live scores are low (Itnig, 2026-10-10: 0.17 to 0.49), which node leads and by how much is what tells. nav-api's `status` is not used.
+- **Seeing.** Each node is multiplied by exp((its score − the best score) / `NAV_BELIEF_TEMPERATURE`), and by `NAV_BELIEF_GATE` when nav-api marks it `plausible: false` (farther than walked). A node not among the candidates scores as the lowest listed, at most `best` minus `margin`. Only score differences count: live scores are low (Itnig, 2026-10-10: 0.17 to 0.49), which node leads and by how much is what tells. nav-api's `status` is not used, except for a pose:
+- **Pose.** When `status` is `confirmed` by a pose (the result has a `pose` whose `node` is `best`: the camera's position from the map's 3D model, with enough inliers, in that node's region, and walked far enough from `previous`), the belief is all on that node: the user is there, whatever the scores say. `NAV_POSE=0` turns this off (the scores alone, as before). On held-out walks a pose is within 1 m and 10° of the truth 90% of the time (nav-engine `bench/metric/REPORT.md`), where the scores pick a frame a median 0.6 to 2.7 m off.
 
 1. **Locating**, at the start of a session and after lost. `localize` without `expected`; after lost, with the last node as `previous` and its step count as `previous_step_count`. Once a node is `NAV_BELIEF_REACH` likely, the user is there. Then `route` from that node to the destination, once. If the node is the destination, the output is `arrived`. With `found: false`, the output is `wait` with the instruction "I can't find a way to the {label} from here.", said once (not "Please hold still": the camera is not the problem); locating goes on, and `route` is asked again only once the user is located at another node. Until the user is located, the output is `wait` with `uncertain: true`.
 2. **Following** the route from the current hop `source → target`. `localize` with `previous` = source, `expected` = target, each frame's `motion` and `previous_step_count`. Once the most likely node ahead (the target or a node further on the route) is `NAV_BELIEF_REACH` likely, the user is at that node: it becomes their node (with the newest `stepCount`) and the route goes on from it, past any node the camera missed; at the destination the output is `arrived`. Hop by hop only, a missed node dropped the route: live, 8 of the 15 restarts where another node won were a node further on the route, walked past (Itnig, 2026-10-10; orient-orchestrator `tests/fixtures/itnig-following-restarts.json`).
@@ -336,17 +337,20 @@ Which node the camera sees. Called for every evaluation. `multipart/form-data`:
 ```json
 200 {
   "map_id": "itnig", "model": "gmberton/MegaLoc:5fe0dd6…", "frames": 1,
-  "status": "confirmed", "reason": "clear: score >= 0.45, margin >= 0.05, 3 m walked from the last confirmed node",
+  "status": "confirmed", "reason": "pose: 212 inliers at Stage corridor, 3 m walked from the last confirmed node",
   "best": "n4", "margin": 0.08,
   "candidates": [{ "node": "n4", "name": "Stage corridor", "score": 0.51, "refs": [], "distance_m": 0.9, "plausible": true }],
   "previous": "n3", "expected": "n4", "expected_score": 0.51, "expected_rank": 1, "walked_m": 3.1,
-  "took_ms": { "embed": 30, "match": 1, "total": 40 }
+  "pose": { "x_m": 12.4, "y_m": -3.1, "heading_deg": 87.5, "inliers": 212, "matches": 540, "focal_px": 905.2,
+            "node": "n4", "frames": ["m0412", "m0587"] },
+  "took_ms": { "embed": 30, "pose": 240, "match": 1, "total": 280 }
 }
 ```
 
-- `status` is `confirmed`, `uncertain` or `lost`; `best` is the top candidate and `margin` its lead over the second. The [navigation loop](#navigation-loop) weighs the candidates' scores into its belief (it doesn't use `status`).
+- `status` is `confirmed`, `uncertain` or `lost`; `best` is the top candidate and `margin` its lead over the second. The [navigation loop](#navigation-loop) weighs the candidates' scores into its belief (it doesn't use `status`, except for a pose).
+- `pose`, when the map has a 3D model (nav-engine builds since pipeline metric-1): where the camera is and which way it faces, in the map's frame (metres, x east, y north; heading clockwise from north), from matching the frames with the map's own frames and their 3D points (PnP). `inliers` says how sure it is: from `NAV_LOC_POSE_INLIERS` (40) the pose confirms the node whose region it is in (`node`, null between nodes), and then `best` is that node, whatever the scores say; a pose between nodes leaves the status `uncertain`. The candidates and their scores stay the embeddings'. No `pose` (null) when the map has no model or the inference host didn't answer in time.
 - The loop's state and the belief (locating or the hop, the most likely node and how likely) go to the trace as `observation`, the best candidate's `score` as `confidence`, and the whole response as `localize`.
-- Timeout 4 s. The first frame after nav-api's inference host restarts can get a 503 while its model loads.
+- Timeout 4 s (a pose takes about 300 ms on top of the embeddings). The first frame after nav-api's inference host restarts can get a 503 while its model loads.
 
 With `motion`:
 
