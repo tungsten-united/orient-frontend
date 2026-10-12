@@ -25,7 +25,7 @@ flowchart LR
   end
 
   subgraph venue["GPU host: teammate machine (helium), or Cloud Run GPU later"]
-    infer["nav-infer<br/>MegaLoc embeddings"]
+    infer["nav-infer<br/>MegaLoc embeddings, live poses"]
   end
 
   jev(["Jev API<br/>Command LLM, writer, decider"])
